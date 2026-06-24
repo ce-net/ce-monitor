@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex,nofollow" />
+<title>ce-watch // security console</title>
+<style>
+  :root {
+    --bg: #07090d;
+    --panel: #0c1119;
+    --panel-2: #0f1623;
+    --line: #1b2436;
+    --ink: #c8d4e3;
+    --ink-dim: #6b7a90;
+    --accent: #2bd4a8;
+    --red: #ff3b5c;
+    --amber: #ffb02e;
+    --blue: #4aa8ff;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(43,212,168,0.07), transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, rgba(255,59,92,0.06), transparent 55%),
+      var(--bg);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), transparent);
+    position: sticky; top: 0; z-index: 5;
+    backdrop-filter: blur(6px);
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand b { color: #fff; letter-spacing: 2px; font-weight: 700; }
+  .brand span { color: var(--ink-dim); letter-spacing: 3px; text-transform: uppercase; font-size: 10px; }
+  .pulse {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--accent); box-shadow: 0 0 10px var(--accent);
+    animation: pulse 2.2s infinite ease-in-out;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+  .spacer { flex: 1; }
+  .unseen {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px;
+    background: var(--panel);
+  }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #2a3346;
+  }
+  .dot.hot { background: var(--red); box-shadow: 0 0 12px var(--red); animation: pulse 1.2s infinite; }
+  button {
+    font-family: var(--mono); font-size: 12px;
+    color: var(--ink); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: #fff; }
+  button.danger:hover { border-color: var(--red); }
+  .bar {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    padding: 12px 20px; border-bottom: 1px solid var(--line);
+  }
+  select, input {
+    font-family: var(--mono); font-size: 12px;
+    color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+  }
+  label { color: var(--ink-dim); text-transform: uppercase; font-size: 10px; letter-spacing: 1px; margin-right: 4px; }
+  .stats { display: flex; gap: 18px; color: var(--ink-dim); }
+  .stats b { color: var(--ink); }
+  main { padding: 0 20px 60px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  thead th {
+    text-align: left; position: sticky; top: 56px; z-index: 2;
+    color: var(--ink-dim); font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1px; font-size: 10px;
+    padding: 10px 10px; border-bottom: 1px solid var(--line);
+    background: var(--bg);
+  }
+  tbody td { padding: 9px 10px; border-bottom: 1px solid rgba(27,36,54,0.6); vertical-align: top; }
+  tbody tr:hover { background: rgba(74,168,255,0.05); }
+  tr.fresh { animation: flash 1.6s ease-out; }
+  @keyframes flash { from { background: rgba(43,212,168,0.16); } to { background: transparent; } }
+  .mono { font-family: var(--mono); }
+  .nid { color: var(--blue); word-break: break-all; }
+  .ip { color: var(--ink-dim); }
+  .reason { color: var(--ink); }
+  .when { color: var(--ink-dim); white-space: nowrap; }
+  .sev { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; border: 1px solid; }
+  .sev.low { color: var(--blue); border-color: rgba(74,168,255,0.4); }
+  .sev.med { color: var(--amber); border-color: rgba(255,176,46,0.4); }
+  .sev.high { color: var(--red); border-color: rgba(255,59,92,0.5); background: rgba(255,59,92,0.08); }
+  .heur { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
+    color: var(--accent); border: 1px solid rgba(43,212,168,0.35); }
+  .sample { color: var(--ink-dim); font-size: 11px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .empty { color: var(--ink-dim); text-align: center; padding: 60px; }
+  .gate { max-width: 420px; margin: 16vh auto; padding: 28px; border: 1px solid var(--line);
+    border-radius: 10px; background: var(--panel); }
+  .gate h1 { font-size: 15px; letter-spacing: 2px; color: #fff; }
+  .gate p { color: var(--ink-dim); line-height: 1.6; }
+  .gate input { width: 100%; margin: 12px 0; padding: 10px; }
+  .err { color: var(--red); min-height: 16px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+const LS_KEY = "ce-watch-admin-token";
+let token = localStorage.getItem(LS_KEY) || "";
+let lastHead = 0;
+let rows = [];
+
+function h(tag, attrs, kids) {
+  const e = document.createElement(tag);
+  for (const k in (attrs||{})) {
+    if (k === "class") e.className = attrs[k];
+    else if (k === "html") e.innerHTML = attrs[k];
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), attrs[k]);
+    else e.setAttribute(k, attrs[k]);
+  }
+  for (const c of (kids||[])) e.append(c.nodeType ? c : document.createTextNode(c));
+  return e;
+}
+
+function gate(msg) {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  const inp = h("input", { type: "password", placeholder: "admin token", autofocus: "true" });
+  const err = h("div", { class: "err" }, [msg || ""]);
+  const submit = () => {
+    token = inp.value.trim();
+    localStorage.setItem(LS_KEY, token);
+    boot();
+  };
+  inp.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  app.append(h("div", { class: "gate" }, [
+    h("h1", {}, ["ce-watch // restricted"]),
+    h("p", {}, ["Operator security console. Provide the admin token to view the flag log."]),
+    inp, err,
+    h("button", { onclick: submit }, ["unlock"]),
+  ]));
+  inp.focus();
+}
+
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers, { "x-ce-admin": token });
+  return fetch(path, opts);
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+
+function renderShell() {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+  app.append(
+    h("header", {}, [
+      h("div", { class: "pulse" }, []),
+      h("div", { class: "brand" }, [ h("b", {}, ["CE-WATCH"]), h("span", {}, ["security console"]) ]),
+      h("div", { class: "spacer" }, []),
+      h("div", { class: "unseen" }, [
+        h("div", { id: "dot", class: "dot" }, []),
+        h("span", { id: "unseen-label", class: "ip" }, ["0 unseen"]),
+      ]),
+      h("button", { class: "danger", onclick: markSeen }, ["mark seen"]),
+      h("button", { onclick: () => { localStorage.removeItem(LS_KEY); token=""; gate("locked"); } }, ["lock"]),
+    ]),
+    h("div", { class: "bar" }, [
+      h("label", {}, ["heuristic"]),
+      sel("f-heur", ["", "H1","H2","H3","H4","H5","H6"]),
+      h("label", {}, ["severity"]),
+      sel("f-sev", ["", "low","med","high"]),
+      h("label", {}, ["node"]),
+      h("input", { id: "f-node", placeholder: "node_id / ip:…", oninput: () => refresh(true) }),
+      h("button", { onclick: () => refresh(true) }, ["apply"]),
+      h("div", { class: "spacer" }, []),
+      h("div", { class: "stats" }, [
+        h("span", {}, [ "total ", h("b", { id: "stat-total" }, ["0"]) ]),
+        h("span", {}, [ "shown ", h("b", { id: "stat-shown" }, ["0"]) ]),
+      ]),
+    ]),
+    h("main", {}, [
+      h("table", {}, [
+        h("thead", {}, [ h("tr", {}, [
+          th("when"), th("who"), th("where"), th("why"), th("severity"), th("sample"),
+        ]) ]),
+        h("tbody", { id: "rows" }, []),
+      ]),
+      h("div", { id: "empty", class: "empty" }, []),
+    ]),
+  );
+  document.getElementById("f-heur").addEventListener("change", () => refresh(true));
+  document.getElementById("f-sev").addEventListener("change", () => refresh(true));
+}
+
+function th(t) { return h("th", {}, [t]); }
+function sel(id, opts) {
+  const s = h("select", { id });
+  for (const o of opts) s.append(h("option", { value: o }, [o === "" ? "all" : o]));
+  return s;
+}
+
+function markSeen() {
+  api("/admin/seen", { method: "POST" }).then(updateUnseen);
+}
+
+async function updateUnseen() {
+  try {
+    const r = await api("/admin/unseen");
+    if (!r.ok) return;
+    const j = await r.json();
+    const dot = document.getElementById("dot");
+    const lbl = document.getElementById("unseen-label");
+    if (!dot) return;
+    if (j.unseen > 0) { dot.classList.add("hot"); lbl.textContent = j.unseen + " unseen"; }
+    else { dot.classList.remove("hot"); lbl.textContent = "0 unseen"; }
+  } catch (e) {}
+}
+
+async function refresh(replace) {
+  const heur = document.getElementById("f-heur").value;
+  const sev = document.getElementById("f-sev").value;
+  const node = document.getElementById("f-node").value.trim();
+  const qs = new URLSearchParams();
+  if (heur) qs.set("heuristic", heur);
+  if (sev) qs.set("severity", sev);
+  if (node) qs.set("node", node);
+  // When filters are active, always do a full (replace) fetch; incremental `since` only when
+  // showing the unfiltered live feed.
+  const filtered = heur || sev || node;
+  if (!filtered && !replace && lastHead) qs.set("since", lastHead);
+
+  let r;
+  try { r = await api("/admin/flags?" + qs.toString()); }
+  catch (e) { return; }
+  if (r.status === 401) { gate("invalid token"); return; }
+  if (!r.ok) return;
+  const j = await r.json();
+
+  if (filtered || replace) { rows = j.flags; }
+  else {
+    // prepend new rows, mark fresh
+    for (const f of j.flags) f._fresh = true;
+    rows = j.flags.concat(rows).slice(0, 2000);
+  }
+  if (j.head) lastHead = j.head;
+  drawRows();
+  document.getElementById("stat-total").textContent = j.head || rows.length;
+  document.getElementById("stat-shown").textContent = rows.length;
+  updateUnseen();
+}
+
+function drawRows() {
+  const tb = document.getElementById("rows");
+  const empty = document.getElementById("empty");
+  tb.innerHTML = "";
+  if (!rows.length) { empty.textContent = "no flags match the current filter"; return; }
+  empty.textContent = "";
+  for (const f of rows) {
+    const sampleStr = f.sample ? JSON.stringify(f.sample) : "";
+    const tr = h("tr", { class: f._fresh ? "fresh" : "" }, [
+      h("td", { class: "when" }, [fmtTime(f.ts)]),
+      h("td", {}, [
+        h("div", { class: "nid mono" }, [f.node_id]),
+        h("div", { class: "ip" }, [f.ip]),
+      ]),
+      h("td", { class: "ip" }, [ where(f) ]),
+      h("td", {}, [
+        h("span", { class: "heur" }, [f.heuristic]),
+        h("div", { class: "reason" }, [" " + f.reason]),
+      ]),
+      h("td", {}, [ h("span", { class: "sev " + (f.severity||"low") }, [f.severity||"low"]) ]),
+      h("td", { class: "sample", title: sampleStr }, [sampleStr]),
+    ]);
+    tb.append(tr);
+    f._fresh = false;
+  }
+}
+
+function where(f) {
+  const s = f.sample || {};
+  return s.endpoint || s.func || s.chosen_node || s.target || "—";
+}
+
+function boot() {
+  if (!token) { gate(); return; }
+  renderShell();
+  refresh(true);
+  if (window._ceTimer) clearInterval(window._ceTimer);
+  window._ceTimer = setInterval(() => refresh(false), 4000);
+}
+
+boot();
+</script>
+</body>
+</html>
