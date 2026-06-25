@@ -1,51 +1,53 @@
-//! ce-watch as a thin RELYING PARTY of ce-auth.
+//! ce-watch as a thin RELYING PARTY of ce-auth — over the CE MESH, not HTTP.
 //!
 //! ce-watch no longer manages devices, holds no admin store, and runs no in-process crypto. It
-//! delegates every admin decision to **ce-auth** (the operator's SSO surface), reached over HTTP at
-//! `CE_AUTH_URL` (default `http://127.0.0.1:8972`). The contract every app relies on:
+//! delegates every admin decision to **ce-auth** (the operator's SSO surface), reached as a
+//! mesh-native service: ce-auth advertises the pinned name `ce-auth` and answers verbs on the topic
+//! `ce-auth/rpc` over libp2p ([`ce_rs::serve`]). ce-watch [`ce_rs::locate`]s a live instance and
+//! sends it requests via [`ce_rs::CeClient::request`]. There is NO HTTP hop to ce-auth and no shared
+//! secret. The contract every relying party uses:
 //!
-//!   - `GET  {ce-auth}/challenge?aud=ce-watch` -> `{ aud, nonce, ts }`. We proxy this verbatim from
-//!     our own `GET /admin/challenge` so the console never needs to know ce-auth's address.
-//!   - `POST {ce-auth}/verify { aud, deviceId, sig, nonce, ts }` -> `{ ok, role, deviceId }`. We
-//!     forward the device-signed headers off an incoming admin request and admit iff `ok == true`.
+//!   - verb `challenge` `{ aud }` -> `{ aud, nonce, ts }`. We surface this through our own
+//!     `GET /admin/challenge` so the browser console never needs to know how to reach ce-auth.
+//!   - verb `verify` `{ aud, deviceId, sig, nonce, ts }` -> `{ ok, role, deviceId, .. }`. We forward
+//!     the device-signed values off an incoming admin request and admit iff `ok == true`.
 //!
 //! A device enrolled in ce-auth == the operator == trusted by ce-watch. Device enrollment, claim,
 //! request, approve and revoke all live in ce-auth now; this file holds only the relying-party glue.
 //!
-//! The [`Verifier`] trait abstracts the call to ce-auth so handlers (and tests) can inject a mock
-//! verifier instead of standing up a real ce-auth. [`HttpVerifier`] is the production implementation.
-
-use std::time::Duration;
+//! The [`Verifier`] trait abstracts the mesh round-trips to ce-auth so handlers (and tests) can
+//! inject a mock instead of standing up a real ce-auth + node. [`MeshVerifier`] is the production
+//! implementation; it is fail-closed — any locate/transport/decode failure maps to
+//! [`VerifyError::Unreachable`] (-> 503), never to an admit.
 
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 /// The audience ce-watch binds challenges to. ce-auth derives + TTL-checks the stateless nonce
 /// against this exact string, so a signature minted for a different `aud` will not verify.
 pub const AUD: &str = "ce-watch";
 
-/// Default ce-auth base URL when `CE_AUTH_URL` is unset — the deployed local ce-auth sidecar.
-pub const DEFAULT_CE_AUTH_URL: &str = "http://127.0.0.1:8972";
+/// The pinned mesh service name ce-auth advertises and relying parties `locate`. Mirrors
+/// `ce_auth::service::SERVICE_NAME`.
+pub const CE_AUTH_SERVICE: &str = "ce-auth";
 
-/// Resolve the ce-auth base URL from `CE_AUTH_URL`, falling back to [`DEFAULT_CE_AUTH_URL`].
-/// Any trailing slash is trimmed so we can join paths with a single `/`.
-pub fn ce_auth_url() -> String {
-    let raw = std::env::var("CE_AUTH_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_CE_AUTH_URL.to_string());
-    raw.trim_end_matches('/').to_string()
-}
+/// The mesh request/reply topic for ce-auth verbs. Mirrors `ce_auth::service::TOPIC`.
+pub const CE_AUTH_TOPIC: &str = "ce-auth/rpc";
+
+/// Per-request mesh timeout for a ce-auth round-trip (locate + request). Generous enough for a DHT
+/// lookup + one mesh hop, short enough that an auth outage fails closed promptly.
+pub const MESH_TIMEOUT_MS: u64 = 5_000;
 
 /// The five device-signed headers a console request carries, lifted off an incoming request. These
-/// are exactly the fields ce-auth's `/verify` needs to re-derive the nonce and check the signature
-/// against the device's enrolled ECDSA pub.
+/// are exactly the fields ce-auth's `verify` verb needs to re-derive the nonce and check the
+/// signature against the device's enrolled ECDSA pub.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
     pub device_id: String,
     pub sig: String,
     /// The `x-ce-aud` the request claimed. Captured for logging/assertions; ce-watch always sends
-    /// its own pinned [`AUD`] to ce-auth's `/verify`, so a token minted for a different app can never
+    /// its own pinned [`AUD`] to ce-auth's `verify`, so a token minted for a different app can never
     /// be replayed here even if the header claims otherwise.
     #[cfg_attr(not(test), allow(dead_code))]
     pub aud: String,
@@ -68,11 +70,12 @@ impl SignedHeaders {
     }
 }
 
-/// The body ce-watch POSTs to `{ce-auth}/verify`. `aud` is always pinned to ce-watch's own audience
-/// regardless of what the request claimed, so a device cannot get admitted here with a token minted
-/// for a different app.
+/// The body ce-watch sends to ce-auth's `verify` verb. `aud` is always pinned to ce-watch's own
+/// audience regardless of what the request claimed, so a device cannot get admitted here with a
+/// token minted for a different app.
 #[derive(Debug, Serialize)]
 pub struct VerifyRequest<'a> {
+    pub verb: &'a str,
     pub aud: &'a str,
     #[serde(rename = "deviceId")]
     pub device_id: &'a str,
@@ -81,7 +84,9 @@ pub struct VerifyRequest<'a> {
     pub ts: &'a str,
 }
 
-/// ce-auth's `/verify` response. We admit iff `ok == true`; `role`/`deviceId` are surfaced for logs.
+/// ce-auth's `verify` reply. We admit iff `ok == true`; `role`/`deviceId` are surfaced for logs.
+/// ce-auth also returns `nodeId`/`cap`/`capRoot` on success, which ce-watch ignores (it only needs
+/// the boolean admit decision; the bridged cap is for apps that verify caps offline).
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerifyResponse {
     pub ok: bool,
@@ -91,6 +96,15 @@ pub struct VerifyResponse {
     pub device_id: String,
 }
 
+/// A fresh challenge `{ aud, nonce, ts }` minted by ce-auth's `challenge` verb. ce-watch relays this
+/// verbatim to the browser console, which signs it with its device key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Challenge {
+    pub aud: String,
+    pub nonce: String,
+    pub ts: String,
+}
+
 /// Why a verify attempt did not admit. `Unreachable` is fail-closed -> 503; everything else -> 401.
 #[derive(Debug)]
 pub enum VerifyError {
@@ -98,79 +112,152 @@ pub enum VerifyError {
     MissingHeaders,
     /// ce-auth answered, but `ok == false` (bad signature, expired nonce, or not an admin).
     Denied(VerifyResponse),
-    /// ce-auth could not be reached (or returned a transport/5xx error). Fail closed.
+    /// ce-auth could not be reached over the mesh (no live instance, transport error, or an
+    /// undecodable reply). Fail closed.
     Unreachable(String),
 }
 
-/// Abstracts the call to ce-auth's `/verify`, so handlers can be tested against a mock verifier
-/// without a live ce-auth. Implementors take the device-signed headers and return ce-auth's verdict.
+/// Abstracts the mesh round-trips to ce-auth, so handlers can be tested against a mock verifier
+/// without a live ce-auth + node. Implementors run the `challenge` and `verify` verbs.
+///
+/// Async because the production path is a mesh request (locate + request) over `ce-rs`.
 pub trait Verifier: Send + Sync {
-    /// Verify the request's device-signed headers against ce-auth. The `aud` sent to ce-auth is
-    /// always [`AUD`]; the device id / sig / nonce / ts come from the headers.
-    fn verify(&self, headers: &SignedHeaders) -> Result<VerifyResponse, VerifyError>;
+    /// Run ce-auth's `verify` verb for the request's device-signed values. The `aud` sent is always
+    /// [`AUD`]; the device id / sig / nonce / ts come from the headers.
+    fn verify(
+        &self,
+        headers: &SignedHeaders,
+    ) -> impl std::future::Future<Output = Result<VerifyResponse, VerifyError>> + Send;
+
+    /// Run ce-auth's `challenge` verb for [`AUD`], returning a fresh `{ aud, nonce, ts }` to relay to
+    /// the console. A locate/transport/decode failure is fail-closed [`VerifyError::Unreachable`].
+    fn challenge(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Challenge, VerifyError>> + Send;
 }
 
-/// Production [`Verifier`]: POSTs to `{ce-auth}/verify` with a short timeout and admits on
-/// `{ok:true}`. A transport error, timeout, or non-2xx status is treated as [`VerifyError::Unreachable`]
-/// (fail-closed) so a ce-auth outage can never silently admit a request.
-pub struct HttpVerifier {
-    base_url: String,
-    client: reqwest::blocking::Client,
+/// Production [`Verifier`]: locates a live `ce-auth` instance over the mesh and sends it verb
+/// requests on [`CE_AUTH_TOPIC`] via [`ce_rs::CeClient::request`]. Any failure to locate, send, or
+/// decode is [`VerifyError::Unreachable`] (fail-closed) so a ce-auth outage can never silently admit.
+///
+/// It reuses the SAME [`ce_rs::CeClient`] the flag receiver attaches to (the co-located ce node), so
+/// there is exactly one node attachment for the whole console.
+pub struct MeshVerifier {
+    ce: ce_rs::CeClient,
 }
 
-impl HttpVerifier {
-    /// Build an `HttpVerifier` against `base_url` (already slash-trimmed) with a 5s request timeout.
-    pub fn new(base_url: String) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
-        Self { base_url, client }
+impl MeshVerifier {
+    /// Build a `MeshVerifier` driving the given (already-attached) ce node client.
+    pub fn new(ce: ce_rs::CeClient) -> Self {
+        Self { ce }
+    }
+
+    /// Locate a live ce-auth instance and send it one verb envelope, returning the decoded JSON
+    /// reply. All failure modes collapse to [`VerifyError::Unreachable`] (fail-closed).
+    async fn call(&self, payload: &[u8]) -> Result<Value, VerifyError> {
+        let reply = ce_rs::locate::call(
+            &self.ce,
+            CE_AUTH_SERVICE,
+            CE_AUTH_TOPIC,
+            payload,
+            &ce_rs::locate::LocateOpts::default(),
+            MESH_TIMEOUT_MS,
+        )
+        .await
+        .map_err(|e| VerifyError::Unreachable(format!("ce-auth mesh request: {e}")))?;
+        serde_json::from_slice(&reply)
+            .map_err(|e| VerifyError::Unreachable(format!("decode ce-auth reply: {e}")))
     }
 }
 
-impl Verifier for HttpVerifier {
-    fn verify(&self, headers: &SignedHeaders) -> Result<VerifyResponse, VerifyError> {
+impl Verifier for MeshVerifier {
+    async fn verify(&self, headers: &SignedHeaders) -> Result<VerifyResponse, VerifyError> {
         let body = VerifyRequest {
+            verb: "verify",
             aud: AUD,
             device_id: &headers.device_id,
             sig: &headers.sig,
             nonce: &headers.nonce,
             ts: &headers.ts,
         };
-        let url = format!("{}/verify", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .map_err(|e| VerifyError::Unreachable(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(VerifyError::Unreachable(format!(
-                "ce-auth /verify status {}",
-                resp.status()
-            )));
-        }
-        let v: VerifyResponse = resp
-            .json()
-            .map_err(|e| VerifyError::Unreachable(format!("decode ce-auth /verify: {e}")))?;
-        if v.ok {
-            Ok(v)
+        let payload = serde_json::to_vec(&body)
+            .map_err(|e| VerifyError::Unreachable(format!("encode verify request: {e}")))?;
+        let v = self.call(&payload).await?;
+        // ce-auth never returns a transport error in-band; a `{ "error": .. }` reply (e.g. a bad
+        // envelope) is treated as a denial, not an admit.
+        let resp = VerifyResponse {
+            ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            role: v.get("role").and_then(Value::as_str).unwrap_or_default().to_string(),
+            device_id: v
+                .get("deviceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        if resp.ok {
+            Ok(resp)
         } else {
-            Err(VerifyError::Denied(v))
+            Err(VerifyError::Denied(resp))
         }
+    }
+
+    async fn challenge(&self) -> Result<Challenge, VerifyError> {
+        let payload = serde_json::to_vec(&json!({ "verb": "challenge", "aud": AUD }))
+            .map_err(|e| VerifyError::Unreachable(format!("encode challenge request: {e}")))?;
+        let v = self.call(&payload).await?;
+        let ch = Challenge {
+            aud: v.get("aud").and_then(Value::as_str).unwrap_or(AUD).to_string(),
+            nonce: v.get("nonce").and_then(Value::as_str).unwrap_or_default().to_string(),
+            ts: v.get("ts").and_then(Value::as_str).unwrap_or_default().to_string(),
+        };
+        // A challenge with no nonce is a malformed reply (ce-auth could not mint one); fail closed
+        // rather than hand the console a useless challenge it cannot sign.
+        if ch.nonce.is_empty() || ch.ts.is_empty() {
+            return Err(VerifyError::Unreachable("ce-auth challenge missing nonce/ts".into()));
+        }
+        Ok(ch)
     }
 }
 
 /// Run the full relying-party check for an incoming admin request: lift the device-signed headers,
-/// then ask the [`Verifier`]. Returns the authenticated admin device id on `{ok:true}`.
-pub fn require_admin(
-    verifier: &dyn Verifier,
+/// then ask the [`Verifier`] over the mesh. Returns the authenticated admin device id on `{ok:true}`.
+pub async fn require_admin(
+    verifier: &dyn DynVerifier,
     headers: &HeaderMap,
 ) -> Result<String, VerifyError> {
     let signed = SignedHeaders::from_headers(headers).ok_or(VerifyError::MissingHeaders)?;
-    let v = verifier.verify(&signed)?;
+    let v = verifier.verify_dyn(&signed).await?;
     Ok(v.device_id)
+}
+
+/// Object-safe shim over [`Verifier`] so `AppState` can hold an `Arc<dyn DynVerifier>` (a trait with
+/// native `async fn` is not object-safe). Auto-implemented for every [`Verifier`].
+pub trait DynVerifier: Send + Sync {
+    fn verify_dyn<'a>(
+        &'a self,
+        headers: &'a SignedHeaders,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<VerifyResponse, VerifyError>> + Send + 'a>>;
+
+    fn challenge_dyn<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Challenge, VerifyError>> + Send + 'a>>;
+}
+
+impl<T: Verifier> DynVerifier for T {
+    fn verify_dyn<'a>(
+        &'a self,
+        headers: &'a SignedHeaders,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<VerifyResponse, VerifyError>> + Send + 'a>>
+    {
+        Box::pin(self.verify(headers))
+    }
+
+    fn challenge_dyn<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Challenge, VerifyError>> + Send + 'a>>
+    {
+        Box::pin(self.challenge())
+    }
 }
 
 #[cfg(test)]
@@ -187,17 +274,6 @@ mod tests {
             );
         }
         h
-    }
-
-    #[test]
-    fn ce_auth_url_defaults_and_trims() {
-        // Default when unset.
-        unsafe { std::env::remove_var("CE_AUTH_URL") };
-        assert_eq!(ce_auth_url(), DEFAULT_CE_AUTH_URL);
-        // Trailing slash trimmed.
-        unsafe { std::env::set_var("CE_AUTH_URL", "http://example:9000/") };
-        assert_eq!(ce_auth_url(), "http://example:9000");
-        unsafe { std::env::remove_var("CE_AUTH_URL") };
     }
 
     #[test]
@@ -226,5 +302,25 @@ mod tests {
             // x-ce-ts missing
         ]);
         assert!(SignedHeaders::from_headers(&h).is_none());
+    }
+
+    #[test]
+    fn verify_request_serializes_with_verb_and_pinned_aud() {
+        // The wire envelope must carry verb=verify and ce-watch's own AUD, never the request's claim.
+        let body = VerifyRequest {
+            verb: "verify",
+            aud: AUD,
+            device_id: "dev1",
+            sig: "sigA",
+            nonce: "nnn",
+            ts: "2026-06-24T00:00:00.000Z",
+        };
+        let v: Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["verb"], "verify");
+        assert_eq!(v["aud"], "ce-watch");
+        assert_eq!(v["deviceId"], "dev1");
+        assert_eq!(v["sig"], "sigA");
+        assert_eq!(v["nonce"], "nnn");
+        assert_eq!(v["ts"], "2026-06-24T00:00:00.000Z");
     }
 }

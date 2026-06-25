@@ -128,15 +128,17 @@ pub fn hub_node() -> String {
 /// Run the live mesh receiver forever: open the node's app-message SSE stream and feed every message
 /// through `ingest`. Reconnects with a fixed backoff; if the local node is unreachable it logs a
 /// warning and retries (it NEVER crashes the console). Spawn this as a background task at startup.
-pub async fn run(node_url: String, ingest: Arc<MeshIngest>) {
+///
+/// Takes the shared [`ce_rs::CeClient`] (the one attachment to the co-located node) so the flag
+/// receiver and the ce-auth relying-party verifier ride the same node.
+pub async fn run(ce: ce_rs::CeClient, ingest: Arc<MeshIngest>) {
     use futures_util::StreamExt as _;
 
-    let ce = ce_rs::CeClient::new(node_url.clone());
     let mut backoff = Duration::from_millis(500);
     loop {
         match ce.messages_stream().await {
             Ok(stream) => {
-                tracing::info!(node_url = %node_url, topic = FLAG_TOPIC, "ce-watch mesh inbox up");
+                tracing::info!(node_url = %ce.base_url(), topic = FLAG_TOPIC, "ce-watch mesh inbox up");
                 backoff = Duration::from_millis(500);
                 let mut stream = std::pin::pin!(stream);
                 while let Some(item) = stream.next().await {
@@ -154,7 +156,7 @@ pub async fn run(node_url: String, ingest: Arc<MeshIngest>) {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    node_url = %node_url,
+                    node_url = %ce.base_url(),
                     "ce-watch: local ce node unreachable; retrying mesh inbox"
                 );
             }

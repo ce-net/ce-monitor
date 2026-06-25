@@ -17,11 +17,13 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-# ce-rs SDK: drives the co-located ce node over http://127.0.0.1:8844 to drain the mesh
-# app-message stream (messages_stream). Flag ingest is now a real mesh hop authenticated by the
-# libp2p sender NodeId — no HTTP, no shared token between the hub and ce-watch.
-ce-rs = { path = "../ce-rs" }
+# ce-rs SDK: drives the co-located ce node over http://127.0.0.1:8844. The SAME client (1) drains the
+# inbound mesh app-message stream (messages_stream) for flag ingest — authenticated by the libp2p
+# sender NodeId, no shared token — and (2) locates + requests the mesh-native ce-auth service
+# (locate::call on topic "ce-auth/rpc") for admin device-auth. ce-watch makes NO outbound HTTP: the
+# only HTTP edge is the browser console hitting ce-watch's own endpoints. reqwest is gone.
+# `locate` = mesh-native service discovery + selection (ce_rs::locate) used to find a live ce-auth.
+ce-rs = { path = "../ce-rs", features = ["locate"] }
 futures-util = "0.3"
 
 [dev-dependencies]

@@ -11,13 +11,16 @@
 //!      structured, filterable table with an unseen-count indicator.
 //!
 //! ce-watch holds NO device registry and NO in-process crypto. It is a thin **relying party** of
-//! **ce-auth**: every admin request carries the operator's device-signed headers, which ce-watch
-//! forwards to ce-auth's `POST /verify`; it admits iff `{ok:true}`. Device enrollment, claim,
-//! request, approve and revoke all live in ce-auth (`auth.ce-net.com`). If ce-auth is unreachable,
-//! ce-watch fails CLOSED (503).
+//! **ce-auth**, reached over the CE MESH (not HTTP): every admin request carries the operator's
+//! device-signed headers, which ce-watch forwards to ce-auth's `verify` verb (located via
+//! [`ce_rs::locate`], sent via [`ce_rs::CeClient::request`] on topic `ce-auth/rpc`); it admits iff
+//! `{ok:true}`. Device enrollment, claim, request, approve and revoke all live in ce-auth. If no live
+//! ce-auth instance can be reached, ce-watch fails CLOSED (503).
 //!
-//! `GET /admin/challenge` proxies ce-auth's `GET /challenge?aud=ce-watch` verbatim so the console
-//! never needs to know ce-auth's address.
+//! `GET /admin/challenge` runs ce-auth's `challenge` verb over the mesh and relays the
+//! `{ aud, nonce, ts }` so the browser console never needs to know how to reach ce-auth. That HTTP
+//! edge is the only HTTP in ce-watch's auth path, and it terminates at this process; the hop to
+//! ce-auth is pure mesh.
 
 mod auth;
 mod mesh;
@@ -36,7 +39,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
-use auth::{HttpVerifier, Verifier, VerifyError};
+use auth::{DynVerifier, MeshVerifier, VerifyError};
 use mesh::MeshIngest;
 use store::Store;
 
@@ -45,14 +48,9 @@ const CONSOLE_HTML: &str = include_str!("console.html");
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
-    /// Base URL of ce-auth (e.g. `http://127.0.0.1:8972`), used to proxy `/challenge` and to fetch
-    /// the (lazily-built) [`Verifier`]'s endpoint. Slash-trimmed.
-    ce_auth_url: Arc<String>,
-    /// The relying-party verifier: forwards device-signed headers to ce-auth's `/verify`. Injectable
-    /// so tests can supply a mock instead of a live ce-auth.
-    verifier: Arc<dyn Verifier>,
-    /// HTTP client used to proxy `GET /admin/challenge` -> ce-auth `GET /challenge?aud=ce-watch`.
-    http: reqwest::Client,
+    /// The relying-party verifier: runs ce-auth's `challenge` / `verify` verbs over the mesh.
+    /// Injectable so tests can supply a mock instead of a live ce-auth + node.
+    verifier: Arc<dyn DynVerifier>,
 }
 
 #[tokio::main]
@@ -67,14 +65,16 @@ async fn main() -> Result<()> {
     let data_dir = store::default_data_dir();
     let store = Arc::new(Store::open(data_dir.clone())?);
 
-    let ce_auth_url = auth::ce_auth_url();
-    tracing::info!(ce_auth_url = %ce_auth_url, "delegating admin device-auth to ce-auth");
-
-    let verifier: Arc<dyn Verifier> = Arc::new(HttpVerifier::new(ce_auth_url.clone()));
-
-    // Flag ingest is a MESH receiver: attach to the co-located ce node and drain its app-message
-    // stream, admitting only flags from the hub's NodeId on topic `ce-watch/flag`. No HTTP, no token.
+    // Attach to the co-located ce node ONCE; the same client drives both the flag receiver and the
+    // mesh relying-party verifier (locate + request ce-auth). No HTTP hop to ce-auth.
     let node_url = mesh::ce_node_url();
+    let ce = ce_rs::CeClient::new(node_url.clone());
+    tracing::info!(node_url = %node_url, service = auth::CE_AUTH_SERVICE, "delegating admin device-auth to ce-auth over the mesh");
+
+    let verifier: Arc<dyn DynVerifier> = Arc::new(MeshVerifier::new(ce.clone()));
+
+    // Flag ingest is a MESH receiver: drain the node's app-message stream, admitting only flags from
+    // the hub's NodeId on topic `ce-watch/flag`. No HTTP, no token.
     let hub_node = mesh::hub_node();
     if hub_node.is_empty() {
         tracing::warn!(
@@ -84,14 +84,9 @@ async fn main() -> Result<()> {
         tracing::info!(hub_node = %hub_node, node_url = %node_url, "ce-watch mesh flag ingest armed");
     }
     let ingest = Arc::new(MeshIngest::new(store.clone(), hub_node));
-    tokio::spawn(mesh::run(node_url, ingest));
+    tokio::spawn(mesh::run(ce.clone(), ingest));
 
-    let state = AppState {
-        store,
-        ce_auth_url: Arc::new(ce_auth_url),
-        verifier,
-        http: reqwest::Client::new(),
-    };
+    let state = AppState { store, verifier };
 
     let app = router(state);
 
@@ -122,33 +117,20 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// `GET /admin/challenge` — proxy ce-auth's `GET /challenge?aud=ce-watch` verbatim. The console
-/// signs the returned `{ aud, nonce, ts }` with its device key; only a device enrolled in ce-auth
-/// can produce a signature that ce-auth will later accept, so handing out challenges is harmless.
-/// If ce-auth is unreachable we fail closed (503).
+/// `GET /admin/challenge` — run ce-auth's `challenge` verb for `aud=ce-watch` over the mesh and relay
+/// the `{ aud, nonce, ts }` to the browser console. The console signs it with its device key; only a
+/// device enrolled in ce-auth can produce a signature that ce-auth's `verify` will later accept, so
+/// handing out challenges is harmless. If no live ce-auth instance can be reached we fail closed
+/// (503). This is the one HTTP edge (console -> ce-watch); the hop to ce-auth is pure mesh.
 async fn admin_challenge(State(st): State<AppState>) -> impl IntoResponse {
-    let url = format!("{}/challenge?aud={}", st.ce_auth_url, auth::AUD);
-    match st.http.get(&url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-            Ok(body) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response(),
-            Err(e) => {
-                tracing::warn!(error = %e, "reading ce-auth /challenge body failed");
-                ce_auth_down()
-            }
-        },
-        Ok(resp) => {
-            tracing::warn!(status = %resp.status(), "ce-auth /challenge returned non-2xx");
+    match st.verifier.challenge_dyn().await {
+        Ok(ch) => (StatusCode::OK, Json(ch)).into_response(),
+        Err(VerifyError::Unreachable(reason)) => {
+            tracing::warn!(reason = %reason, "ce-auth challenge unreachable — failing closed (503)");
             ce_auth_down()
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "ce-auth /challenge unreachable");
-            ce_auth_down()
-        }
+        // challenge() only ever returns Unreachable on failure; any other variant is still fail-safe.
+        Err(_) => ce_auth_down(),
     }
 }
 
@@ -167,18 +149,14 @@ fn ce_auth_down() -> axum::response::Response {
         .into_response()
 }
 
-/// Gate an admin request through ce-auth, running the (blocking) verify off the async executor.
-/// Returns the authenticated admin device id, or the ready response: 401 on missing headers /
-/// denied, 503 on ce-auth unreachable (fail-closed — an auth outage NEVER admits).
+/// Gate an admin request through ce-auth over the mesh. Returns the authenticated admin device id,
+/// or the ready response: 401 on missing headers / denied, 503 on ce-auth unreachable (fail-closed —
+/// an auth outage NEVER admits).
 async fn require_admin_async(
     st: &AppState,
     headers: &HeaderMap,
 ) -> Result<String, axum::response::Response> {
-    let verifier = st.verifier.clone();
-    let headers = headers.clone();
-    let res = tokio::task::spawn_blocking(move || auth::require_admin(verifier.as_ref(), &headers))
-        .await
-        .unwrap_or_else(|_| Err(VerifyError::Unreachable("verify task panicked".into())));
+    let res = auth::require_admin(st.verifier.as_ref(), headers).await;
     match res {
         Ok(id) => Ok(id),
         Err(VerifyError::MissingHeaders) => Err(unauthorized()),
@@ -265,7 +243,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use auth::{SignedHeaders, VerifyResponse};
+    use auth::{Challenge, SignedHeaders, Verifier, VerifyResponse};
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Mutex;
@@ -282,8 +260,10 @@ mod tests {
         d
     }
 
-    /// A mock [`Verifier`] standing in for ce-auth's `/verify`. Configured to admit, deny, or be
-    /// unreachable, and records the headers it was asked to verify so tests can assert the forward.
+    /// A mock [`Verifier`] standing in for ce-auth's mesh `verify` / `challenge` verbs. Configured to
+    /// admit, deny, or be unreachable, and records the headers it was asked to verify so tests can
+    /// assert the forward. No live node or HTTP involved — it injects exactly what the mesh path
+    /// would return.
     struct MockVerifier {
         outcome: MockOutcome,
         seen: Mutex<Option<SignedHeaders>>,
@@ -294,7 +274,7 @@ mod tests {
         Ok { device_id: String, role: String },
         /// `{ok:false}` — ce-auth denied.
         Deny,
-        /// ce-auth could not be reached.
+        /// No live ce-auth instance / mesh transport failed.
         Down,
     }
     impl MockVerifier {
@@ -303,7 +283,7 @@ mod tests {
         }
     }
     impl Verifier for MockVerifier {
-        fn verify(&self, headers: &SignedHeaders) -> Result<VerifyResponse, VerifyError> {
+        async fn verify(&self, headers: &SignedHeaders) -> Result<VerifyResponse, VerifyError> {
             *self.seen.lock().unwrap() = Some(headers.clone());
             match &self.outcome {
                 MockOutcome::Ok { device_id, role } => Ok(VerifyResponse {
@@ -319,14 +299,25 @@ mod tests {
                 MockOutcome::Down => Err(VerifyError::Unreachable("mock down".into())),
             }
         }
+
+        async fn challenge(&self) -> Result<Challenge, VerifyError> {
+            match &self.outcome {
+                // A reachable ce-auth (Ok or Deny outcome) mints a challenge; an unreachable one
+                // fails closed exactly like the mesh path.
+                MockOutcome::Down => Err(VerifyError::Unreachable("mock down".into())),
+                _ => Ok(Challenge {
+                    aud: auth::AUD.to_string(),
+                    nonce: "abcd1234".to_string(),
+                    ts: "2026-06-24T00:00:00.000Z".to_string(),
+                }),
+            }
+        }
     }
 
     fn state_with(dir: std::path::PathBuf, outcome: MockOutcome) -> AppState {
         AppState {
             store: Arc::new(Store::open(dir).expect("open store")),
-            ce_auth_url: Arc::new("http://127.0.0.1:0".to_string()),
             verifier: Arc::new(MockVerifier::new(outcome)),
-            http: reqwest::Client::new(),
         }
     }
 
@@ -436,9 +427,7 @@ mod tests {
         }));
         let st = AppState {
             store: Arc::new(Store::open(dir.clone()).expect("open store")),
-            ce_auth_url: Arc::new("http://127.0.0.1:0".to_string()),
             verifier: mock.clone(),
-            http: reqwest::Client::new(),
         };
         let app = router(st);
         let req = with_headers(Request::builder().uri("/admin/unseen"), &signed_headers())
@@ -505,29 +494,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_challenge_proxies_ce_auth() {
-        // Stand up a tiny stub ce-auth that serves GET /challenge?aud=ce-watch, point ce-watch at it,
-        // and assert /admin/challenge returns the stub's body verbatim.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stub_addr = listener.local_addr().unwrap();
-        let stub = Router::new().route(
-            "/challenge",
-            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
-                assert_eq!(q.get("aud").map(String::as_str), Some("ce-watch"));
-                Json(json!({
-                    "aud": "ce-watch",
-                    "nonce": "abcd1234",
-                    "ts": "2026-06-24T00:00:00.000Z"
-                }))
-            }),
-        );
-        tokio::spawn(async move {
-            axum::serve(listener, stub).await.unwrap();
-        });
-
+    async fn admin_challenge_relays_ce_auth_mesh_challenge() {
+        // A reachable ce-auth (mock) mints a challenge over the mesh; /admin/challenge relays the
+        // { aud, nonce, ts } to the console verbatim.
         let dir = temp_dir();
-        let mut st = state_with(dir.clone(), MockOutcome::Deny);
-        st.ce_auth_url = Arc::new(format!("http://{}", stub_addr));
+        let st = state_with(
+            dir.clone(),
+            MockOutcome::Ok { device_id: "d".into(), role: "admin".into() },
+        );
         let app = router(st);
 
         let req = Request::builder().uri("/admin/challenge").body(Body::empty()).unwrap();
@@ -542,10 +516,9 @@ mod tests {
 
     #[tokio::test]
     async fn admin_challenge_ce_auth_down_is_503() {
-        // Point at a closed port → proxy fails → fail closed (503).
+        // No live ce-auth instance over the mesh → challenge fails → fail closed (503).
         let dir = temp_dir();
-        let mut st = state_with(dir.clone(), MockOutcome::Deny);
-        st.ce_auth_url = Arc::new("http://127.0.0.1:1".to_string());
+        let st = state_with(dir.clone(), MockOutcome::Down);
         let app = router(st);
         let req = Request::builder().uri("/admin/challenge").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
