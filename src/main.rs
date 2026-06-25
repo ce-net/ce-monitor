@@ -23,6 +23,7 @@
 //! ce-auth is pure mesh.
 
 mod auth;
+mod detect;
 mod mesh;
 mod store;
 
@@ -73,18 +74,28 @@ async fn main() -> Result<()> {
 
     let verifier: Arc<dyn DynVerifier> = Arc::new(MeshVerifier::new(ce.clone()));
 
-    // Flag ingest is a MESH receiver: drain the node's app-message stream, admitting only flags from
-    // the hub's NodeId on topic `ce-monitor/flag`. No HTTP, no token.
+    // Abuse detection lives HERE now (not in the hub): drain the node's app-message stream, admit only
+    // observations from the hub's NodeId on topic `ce-monitor/observe`, run the H1-H6 detector, and
+    // append any flags. No HTTP, no token.
     let hub_node = mesh::hub_node();
     if hub_node.is_empty() {
         tracing::warn!(
-            "CE_MONITOR_HUB_NODE is unset — every mesh flag will be rejected (no authorized hub)"
+            "CE_MONITOR_HUB_NODE is unset — every mesh observation will be rejected (no authorized hub)"
         );
     } else {
-        tracing::info!(hub_node = %hub_node, node_url = %node_url, "ce-monitor mesh flag ingest armed");
+        tracing::info!(hub_node = %hub_node, node_url = %node_url, "ce-monitor abuse detector armed");
     }
-    let ingest = Arc::new(MeshIngest::new(store.clone(), hub_node));
-    tokio::spawn(mesh::run(ce.clone(), ingest));
+    let detector = Arc::new(detect::Detector::new());
+    let ingest = Arc::new(MeshIngest::new(store.clone(), detector.clone(), hub_node));
+    tokio::spawn(mesh::run(ce.clone(), ingest.clone()));
+    // H6 (node-overload) is time-based: sweep the gauges periodically and store any flags.
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+        loop {
+            tick.tick().await;
+            ingest.sweep();
+        }
+    });
 
     let state = AppState { store, verifier };
 

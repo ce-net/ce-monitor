@@ -17,10 +17,27 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::store::{FlagEvent, Store};
+use crate::detect::Detector;
+use crate::store::Store;
 
-/// The topic every flag is published on. The hub sends with this exact topic; we filter on it.
-pub const FLAG_TOPIC: &str = "ce-monitor/flag";
+/// The topic the hub emits raw abuse-observations on. ce-monitor runs the detector on them (the hub no
+/// longer detects — it only tracks). We filter our mesh inbox on this exact string.
+pub const OBSERVE_TOPIC: &str = "ce-monitor/observe";
+
+/// One raw observation from ce-hub: a dispatched task (`submit`), a result (`runtime`), or a per-node
+/// in-flight gauge delta (`gauge_inc`/`gauge_dec`). The detector turns these into FlagEvents.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind")]
+enum Observation {
+    #[serde(rename = "submit")]
+    Submit { ip: String, func: String, submit_sig: String, #[serde(default)] module_sha: Option<String>, node: String },
+    #[serde(rename = "runtime")]
+    Runtime { ip: String, node: String, ms: f64 },
+    #[serde(rename = "gauge_inc")]
+    GaugeInc { node: String, #[serde(default)] cores: u32 },
+    #[serde(rename = "gauge_dec")]
+    GaugeDec { node: String },
+}
 
 /// Default ce node API base URL when `CE_NODE_URL` is unset — the co-located local node.
 pub const DEFAULT_CE_NODE_URL: &str = "http://127.0.0.1:8844";
@@ -50,64 +67,75 @@ impl From<ce_rs::AppMessage> for InboundMessage {
 /// The verdict of attempting to ingest one inbound message — used by tests to assert the policy.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ingested {
-    /// Authorized hub flag on the flag topic, deserialized and appended to the store.
+    /// Authorized hub observation processed by the detector (any resulting flags were stored).
     Stored,
-    /// Topic was not [`FLAG_TOPIC`] — ignored.
+    /// Topic was not [`OBSERVE_TOPIC`] — ignored.
     WrongTopic,
     /// Sender NodeId was not the configured hub — rejected (unauthorized).
     Unauthorized,
-    /// Payload was not a valid [`FlagEvent`] JSON — dropped.
+    /// Payload was not a valid [`Observation`] JSON — dropped.
     BadPayload,
 }
 
-/// The receive/authorize/store core. Holds the [`Store`] and the single authorized sender (the
-/// hub's NodeId). Pure of any transport so it can be exercised with injected messages.
+/// The receive/authorize/detect core. Holds the [`Store`], the [`Detector`], and the single authorized
+/// sender (the hub's NodeId). Pure of any transport so it can be exercised with injected messages.
 pub struct MeshIngest {
     store: Arc<Store>,
-    /// The ONLY NodeId whose flags are accepted (the hub's). Empty => accept none (fail closed).
+    detector: Arc<Detector>,
+    /// The ONLY NodeId whose observations are accepted (the hub's). Empty => accept none (fail closed).
     hub_node: String,
 }
 
 impl MeshIngest {
-    /// Build an ingest core that admits flags only from `hub_node` (the hub's NodeId hex).
-    pub fn new(store: Arc<Store>, hub_node: String) -> Self {
-        Self { store, hub_node }
+    /// Build an ingest core that admits observations only from `hub_node` (the hub's NodeId hex).
+    pub fn new(store: Arc<Store>, detector: Arc<Detector>, hub_node: String) -> Self {
+        Self { store, detector, hub_node }
     }
 
-    /// Receive one inbound message: filter topic, authorize by sender NodeId, deserialize, store.
-    ///
-    /// Returns the verdict. Only [`Ingested::Stored`] mutates the store. Authorization is strict:
-    /// an unset/empty `hub_node` accepts nothing (fail closed).
+    /// Receive one inbound message: filter topic, authorize by sender NodeId, deserialize the
+    /// observation, run the detector, and append any resulting flags. Authorization is strict: an
+    /// unset/empty `hub_node` accepts nothing (fail closed).
     pub fn handle(&self, msg: &InboundMessage) -> Ingested {
-        if msg.topic != FLAG_TOPIC {
+        if msg.topic != OBSERVE_TOPIC {
             return Ingested::WrongTopic;
         }
-        // AUTHORIZE BY SENDER: the node proved `msg.from`; only the hub may push flags.
         if self.hub_node.is_empty() || msg.from != self.hub_node {
-            tracing::warn!(
-                from = %msg.from,
-                "ce-monitor: dropping flag from unauthorized sender (not the configured hub node)"
-            );
+            tracing::warn!(from = %msg.from, "ce-monitor: dropping observation from unauthorized sender");
             return Ingested::Unauthorized;
         }
-        let event: FlagEvent = match serde_json::from_slice(&msg.payload) {
-            Ok(ev) => ev,
+        let obs: Observation = match serde_json::from_slice(&msg.payload) {
+            Ok(o) => o,
             Err(e) => {
-                tracing::warn!(error = %e, "ce-monitor: dropping flag with undeserializable payload");
+                tracing::warn!(error = %e, "ce-monitor: dropping observation with undeserializable payload");
                 return Ingested::BadPayload;
             }
         };
-        match self.store.append(event) {
-            Ok(seq) => {
-                tracing::info!(seq, from = %msg.from, "ce-monitor: stored mesh flag");
-                Ingested::Stored
+        let flags = match obs {
+            Observation::Submit { ip, func, submit_sig, module_sha, node } => {
+                self.detector.submit(&ip, &func, &submit_sig, module_sha.as_deref(), &node)
             }
-            Err(e) => {
-                tracing::error!(error = %e, "ce-monitor: store append failed for mesh flag");
-                // Append failure is a storage fault, not a policy outcome; surface as BadPayload so
-                // the caller does not treat it as stored. (The flag is lost; logged loudly above.)
-                Ingested::BadPayload
+            Observation::Runtime { ip, node, ms } => self.detector.runtime(&ip, &node, ms),
+            Observation::GaugeInc { node, cores } => {
+                self.detector.gauge_inc(&node, cores);
+                Vec::new()
             }
+            Observation::GaugeDec { node } => {
+                self.detector.gauge_dec(&node);
+                Vec::new()
+            }
+        };
+        for ev in flags {
+            if let Err(e) = self.store.append(ev) {
+                tracing::error!(error = %e, "ce-monitor: store append failed for detector flag");
+            }
+        }
+        Ingested::Stored
+    }
+
+    /// Run the H6 sweep (called on a timer) and store any flags it raises.
+    pub fn sweep(&self) {
+        for ev in self.detector.sweep_h6() {
+            let _ = self.store.append(ev);
         }
     }
 }
@@ -138,7 +166,7 @@ pub async fn run(ce: ce_rs::CeClient, ingest: Arc<MeshIngest>) {
     loop {
         match ce.messages_stream().await {
             Ok(stream) => {
-                tracing::info!(node_url = %ce.base_url(), topic = FLAG_TOPIC, "ce-monitor mesh inbox up");
+                tracing::info!(node_url = %ce.base_url(), topic = OBSERVE_TOPIC, "ce-monitor mesh inbox up");
                 backoff = Duration::from_millis(500);
                 let mut stream = std::pin::pin!(stream);
                 while let Some(item) = stream.next().await {
